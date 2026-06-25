@@ -1,0 +1,31 @@
+# 编译产物
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+/kafka-play
+/producer/producer
+
+# 测试与覆盖率
+*.test
+*.out
+coverage.txt
+
+# 依赖目录（一般不提交）
+vendor/
+
+# Go workspace
+go.work
+go.work.sum
+
+# 环境变量
+.env
+
+# 编辑器 / IDE
+.idea/
+.vscode/
+*.swp
+
+# 系统文件
+.DS_Store
