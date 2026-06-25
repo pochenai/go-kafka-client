@@ -1,0 +1,16 @@
+# pre 环境配置。prod 时把 brokers 换成 prod 地址、topic 换成 ...Prod 即可。
+brokers = [
+    "",
+    "",
+]
+
+topic = ""
+
+# consumer group id。想每次都从最earliest重头消费，就改这个后缀（换个新 group）。
+group_id = "rwa-xstock-debug-1"
+
+# 只保留 tags 含此 code 的消息。36 = RWA_XSTOCK。
+target_tag = 36
+
+# 命中的事件以 append-only JSONL 追加到这个文件，本地查询直接读它。
+store_file = "xstock_events.jsonl"

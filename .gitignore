@@ -29,3 +29,5 @@ go.work.sum
 
 # 系统文件
 .DS_Store
+rwa-xstock-consumer
+config.toml
