@@ -7,10 +7,8 @@ import (
 	"log"
 	"os"
 	"os/signal"
-	"slices"
 	"strconv"
 	"strings"
-	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -97,6 +95,7 @@ type tokenEvent struct {
 // storedEvent is one record persisted to the local JSONL file, wrapping the raw
 // message with metadata for later querying/dedup.
 type storedEvent struct {
+	Seq        uint64          `json:"seq"` // local monotonic feed cursor, assigned by the store
 	ReceivedAt time.Time       `json:"received_at"`
 	Partition  int             `json:"partition"`
 	Offset     int64           `json:"offset"`
@@ -115,23 +114,24 @@ func main() {
 		log.Fatalf("failed to load config %s: %v", cfgPath, err)
 	}
 
-	// Open the local store file append-only, single writer appending.
-	store, err := os.OpenFile(cfg.StoreFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	// Open the local bbolt store: durable, deduplicated by (partition, offset), and
+	// queryable as a monotonic feed for the pull API.
+	store, err := openStore(cfg.StoreFile)
 	if err != nil {
-		log.Fatalf("failed to open store file %s: %v", cfg.StoreFile, err)
+		log.Fatalf("failed to open store %s: %v", cfg.StoreFile, err)
 	}
 	defer store.Close()
-	enc := json.NewEncoder(store) // each Encode appends a newline, naturally JSONL
 
 	reader := kafka.NewReader(kafka.ReaderConfig{
 		Brokers:     cfg.Brokers,
 		Topic:       cfg.Topic,
 		GroupID:     cfg.GroupID,
 		StartOffset: kafka.FirstOffset, // only applies when the group has no committed offset; with a fresh group this starts from the earliest retained message
-		// Throughput: the default CommitInterval (0) makes ReadMessage commit the
-		// offset synchronously on EVERY message — one broker round-trip per message,
-		// which caps backlog scans at ~RTT^-1 msgs/sec. Batch commits every second
-		// instead, and let each fetch pull a larger chunk.
+		// We commit offsets manually (CommitMessages) only AFTER a matched message is
+		// durably stored in bbolt, so the committed offset never runs ahead of persisted
+		// data. CommitInterval>0 just batches those commits asynchronously (one broker
+		// round-trip per second instead of per message); crash-safety still holds because
+		// re-reading an uncommitted-but-already-stored message is deduped on (partition, offset).
 		CommitInterval: time.Second,
 		MinBytes:       10e3, // 10KB: wait for at least this much before returning a fetch
 		MaxBytes:       10e6, // 10MB: cap per-fetch payload
@@ -146,9 +146,12 @@ func main() {
 	if err := probeBrokers(ctx, cfg.Brokers); err != nil {
 		log.Fatalf("failed to connect to brokers %v: %v", cfg.Brokers, err)
 	}
+
+	lagRep := kafkaLagReporter{brokers: cfg.Brokers, groupID: cfg.GroupID, topic: cfg.Topic}
+
 	// Report how far behind the head we are before starting to consume.
 	lagCtx, lagCancel := context.WithTimeout(ctx, 15*time.Second)
-	if lag, head, err := computeLag(lagCtx, cfg.Brokers, cfg.GroupID, cfg.Topic); err != nil {
+	if lag, head, err := lagRep.Lag(lagCtx); err != nil {
 		log.Printf("startup lag: skip, %v", err)
 	} else {
 		log.Printf("startup lag: behind head by %d messages (group=%s topic=%s head-offset=%d)",
@@ -164,83 +167,9 @@ func main() {
 		heartbeatSecs = 10 // default when unset/invalid in config
 	}
 
-	// Counters shared with the heartbeat goroutine; atomic to avoid a data race.
-	var read, hits, lastOffset, lastPartition, lastMsgMs atomic.Int64
-
-	// Time-based heartbeat: unlike the count-based progress log, this fires on a wall
-	// clock even when no messages are flowing — so a consumer that has caught up to the
-	// head (or stalled) still reports liveness. It queries the live head each tick to
-	// show the TRUE remaining lag: lag≈0 means caught up, lag not shrinking means stuck,
-	// lag shrinking means still catching up.
-	go func() {
-		ticker := time.NewTicker(time.Duration(heartbeatSecs) * time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				qctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-				lag, head, err := computeLag(qctx, cfg.Brokers, cfg.GroupID, cfg.Topic)
-				cancel()
-				age := "n/a"
-				if ms := lastMsgMs.Load(); ms > 0 {
-					age = time.Since(time.UnixMilli(ms)).Round(time.Second).String()
-				}
-				if err != nil {
-					log.Printf("heartbeat: alive read=%d hits=%d lastOffset=%d(p%d) lastMsgAge=%s lag=unknown(%v)",
-						read.Load(), hits.Load(), lastOffset.Load(), lastPartition.Load(), age, err)
-					continue
-				}
-				log.Printf("heartbeat: alive read=%d hits=%d lastOffset=%d(p%d) | behind head by %d msgs (head=%d) lastMsgAge=%s",
-					read.Load(), hits.Load(), lastOffset.Load(), lastPartition.Load(), lag, head, age)
-			}
-		}
-	}()
-
-	for {
-		msg, err := reader.ReadMessage(ctx) // auto-commits offset
-		if err != nil {
-			if ctx.Err() != nil {
-				log.Printf("received shutdown signal, stopped. matched %d RWA_XSTOCK events this run", hits.Load())
-				return
-			}
-			log.Printf("error reading message: %v", err)
-			continue
-		}
-		read.Add(1)
-		lastOffset.Store(msg.Offset)
-		lastPartition.Store(int64(msg.Partition))
-		lastMsgMs.Store(msg.Time.UnixMilli())
-		var env eventEnvelope
-		if err := json.Unmarshal(msg.Value, &env); err != nil {
-			log.Printf("skipping unparseable message (offset=%d): %v", msg.Offset, err)
-			continue
-		}
-		ev := env.Data
-
-		if !slices.Contains(ev.Tags, cfg.TargetTag) {
-			continue // not RWA_XSTOCK, skip
-		}
-
-		fmt.Printf("Received event: %+v\n", ev) // debug print
-
-		rec := storedEvent{
-			ReceivedAt: time.Now(),
-			Partition:  msg.Partition,
-			Offset:     msg.Offset,
-			KafkaTime:  msg.Time,
-			Raw:        json.RawMessage(msg.Value),
-		}
-		if err := enc.Encode(&rec); err != nil {
-			log.Printf("failed to write to store (offset=%d): %v", msg.Offset, err)
-			continue
-		}
-
-		h := hits.Add(1)
-		log.Printf("[RWA_XSTOCK] saved #%d  symbol=%s id=%s tags=%v isRwa=%v  (partition=%d offset=%d)",
-			h, ev.Symbol, ev.ID, ev.Tags, ev.IsRwa, msg.Partition, msg.Offset)
-	}
+	consumer := NewConsumer(reader, store, cfg.TargetTag)
+	go consumer.RunHeartbeat(ctx, lagRep, time.Duration(heartbeatSecs)*time.Second)
+	consumer.Run(ctx)
 }
 
 // probeBrokers dials the configured brokers to verify connectivity and logs the
