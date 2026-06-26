@@ -14,3 +14,7 @@ target_tag = 36
 
 # 命中的事件以 append-only JSONL 追加到这个文件，本地查询直接读它。
 store_file = "xstock_events.jsonl"
+
+# 按时间触发的存活心跳间隔（秒）：即使没有新消息也会定期上报「读到哪了 + 距 head 还差多少」。
+lag≈0=已追平、lag 不降=卡住、lag 在降=正在追。不填或 <=0 时默认 10。
+heartbeat_secs = 10
