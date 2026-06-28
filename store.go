@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"sort"
 	"time"
 
 	bolt "go.etcd.io/bbolt"
@@ -24,6 +25,7 @@ var (
 type eventReader interface {
 	Query(sinceSeq uint64, limit int) (recs []storedEvent, latestSeq uint64, err error)
 	MaxSeq() (uint64, error)
+	TokenDeltas(sinceSeq uint64) (newIDs, deletedIDs []string, latestSeq uint64, err error)
 }
 
 // EventStore is the full storage contract: the write side (eventSink, defined in
@@ -148,6 +150,47 @@ func (s *boltStore) MaxSeq() (uint64, error) {
 		return nil
 	})
 	return max, err
+}
+
+// TokenDeltas scans events with sequence > sinceSeq and returns, per TokenID, the net
+// change since that cursor: a TokenID lands in deletedIDs if its LAST event in the
+// range had IsDeleted set, otherwise in newIDs (last-wins, so add→delete nets to
+// deleted and delete→add nets to new). The two slices are therefore disjoint and
+// sorted. latestSeq is the highest sequence scanned (sinceSeq if nothing is new), to
+// be passed back as the next cursor. Empty TokenIDs are ignored.
+func (s *boltStore) TokenDeltas(sinceSeq uint64) (newIDs, deletedIDs []string, latestSeq uint64, err error) {
+	latestSeq = sinceSeq
+	deleted := make(map[string]bool) // TokenID -> last-seen IsDeleted within the range
+	err = s.db.View(func(tx *bolt.Tx) error {
+		c := tx.Bucket(bktEvents).Cursor()
+		for k, v := c.Seek(be64(sinceSeq + 1)); k != nil; k, v = c.Next() {
+			var rec storedEvent
+			if err := json.Unmarshal(v, &rec); err != nil {
+				return fmt.Errorf("unmarshal record at seq=%d: %w", binary.BigEndian.Uint64(k), err)
+			}
+			latestSeq = binary.BigEndian.Uint64(k)
+			if rec.TokenID == "" {
+				continue
+			}
+			deleted[rec.TokenID] = rec.IsDeleted // later events overwrite earlier ones
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, nil, sinceSeq, err
+	}
+
+	newIDs, deletedIDs = []string{}, []string{} // non-nil so JSON renders [] not null
+	for id, isDel := range deleted {
+		if isDel {
+			deletedIDs = append(deletedIDs, id)
+		} else {
+			newIDs = append(newIDs, id)
+		}
+	}
+	sort.Strings(newIDs)
+	sort.Strings(deletedIDs)
+	return newIDs, deletedIDs, latestSeq, nil
 }
 
 // dedupKey is the stable physical identity of a message: partition + offset. It is

@@ -111,6 +111,8 @@ func (c *Consumer) process(msg kafka.Message) error {
 		Partition:  msg.Partition,
 		Offset:     msg.Offset,
 		KafkaTime:  msg.Time,
+		TokenID:    ev.ID,
+		IsDeleted:  ev.IsDeleted,
 		Raw:        json.RawMessage(msg.Value),
 	}
 	seq, written, err := c.sink.Append(rec)

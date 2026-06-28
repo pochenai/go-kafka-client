@@ -35,3 +35,6 @@ main
 
 # saved kafa consumer state
 *.jsonl
+
+# bbolt local store
+*.db

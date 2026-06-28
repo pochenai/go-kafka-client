@@ -23,7 +23,11 @@ type Config struct {
 	TargetTag     int      `toml:"target_tag"`
 	StoreFile     string   `toml:"store_file"`
 	HeartbeatSecs int      `toml:"heartbeat_secs"` // time-based liveness heartbeat interval in seconds; <=0 falls back to the default
+	APIAddr       string   `toml:"api_addr"`       // JSON-RPC listen address; empty disables the API
 }
+
+// defaultStoreFile is the bbolt database used when store_file is unset.
+const defaultStoreFile = "xstock_events.db"
 
 // eventEnvelope is the outermost wrapper of the Kafka message; the real token
 // structure lives in the data field.
@@ -92,14 +96,17 @@ type tokenEvent struct {
 	ID                     string       `json:"id"`                     // chainIndex-tokenAddress
 }
 
-// storedEvent is one record persisted to the local JSONL file, wrapping the raw
-// message with metadata for later querying/dedup.
+// storedEvent is one record persisted to the local store, wrapping the raw message
+// with metadata for later querying/dedup. TokenID and IsDeleted are denormalized out
+// of Raw so the tokens delta query can classify add/delete without re-parsing Raw.
 type storedEvent struct {
 	Seq        uint64          `json:"seq"` // local monotonic feed cursor, assigned by the store
 	ReceivedAt time.Time       `json:"received_at"`
 	Partition  int             `json:"partition"`
 	Offset     int64           `json:"offset"`
 	KafkaTime  time.Time       `json:"kafka_time"`
+	TokenID    string          `json:"token_id"`   // tokenEvent.id (chainIndex-tokenAddress)
+	IsDeleted  bool            `json:"is_deleted"` // tokenEvent.isDeleted; classifies the event as delete vs add at query time
 	Raw        json.RawMessage `json:"raw"`
 }
 
@@ -112,6 +119,10 @@ func main() {
 	var cfg Config
 	if _, err := toml.DecodeFile(cfgPath, &cfg); err != nil {
 		log.Fatalf("failed to load config %s: %v", cfgPath, err)
+	}
+
+	if cfg.StoreFile == "" {
+		cfg.StoreFile = defaultStoreFile
 	}
 
 	// Open the local bbolt store: durable, deduplicated by (partition, offset), and
@@ -165,6 +176,11 @@ func main() {
 	heartbeatSecs := cfg.HeartbeatSecs // time-based liveness heartbeat interval
 	if heartbeatSecs <= 0 {
 		heartbeatSecs = 10 // default when unset/invalid in config
+	}
+
+	// Serve the JSON-RPC API (read side only) alongside the consumer, if configured.
+	if cfg.APIAddr != "" {
+		go NewAPI(store).Serve(ctx, cfg.APIAddr)
 	}
 
 	consumer := NewConsumer(reader, store, cfg.TargetTag)

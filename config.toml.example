@@ -2,6 +2,7 @@
 brokers = [
     "",
     "",
+    "",
 ]
 
 topic = ""
@@ -12,9 +13,12 @@ group_id = "rwa-xstock-debug-1"
 # 只保留 tags 含此 code 的消息。36 = RWA_XSTOCK。
 target_tag = 36
 
-# 命中的事件以 append-only JSONL 追加到这个文件，本地查询直接读它。
-store_file = "xstock_events.jsonl"
+# 命中的事件写入这个 bbolt 数据库（去重、可按 seq 增量查询）。
+store_file = "xstock_events.db"
 
+# JSON-RPC API 监听地址。留空则不启动 API。
+api_addr = "127.0.0.1:8080"
+
+# lag≈0=已追平、lag 不降=卡住、lag 在降=正在追。不填或 <=0 时默认 10。
 # 按时间触发的存活心跳间隔（秒）：即使没有新消息也会定期上报「读到哪了 + 距 head 还差多少」。
-lag≈0=已追平、lag 不降=卡住、lag 在降=正在追。不填或 <=0 时默认 10。
 heartbeat_secs = 10
