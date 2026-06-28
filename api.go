@@ -47,6 +47,10 @@ const (
 	codeInternalError  = -32603
 )
 
+// maxRequestBytes caps the JSON-RPC request body; real requests are tiny, so this just
+// stops a malformed/oversized body from ballooning memory.
+const maxRequestBytes = 1 << 20 // 1 MiB
+
 // tokensParams is the params object of the tokens method.
 type tokensParams struct {
 	Start uint64 `json:"start"`
@@ -69,6 +73,7 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "JSON-RPC requires POST", http.StatusMethodNotAllowed)
 		return
 	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBytes)
 
 	var req rpcRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -122,7 +127,17 @@ func writeRPC(w http.ResponseWriter, resp rpcResponse) {
 // Serve runs the JSON-RPC HTTP server until ctx is cancelled, then shuts it down
 // gracefully. It blocks, so run it in its own goroutine.
 func (a *API) Serve(ctx context.Context, addr string) {
-	srv := &http.Server{Addr: addr, Handler: a}
+	// Access control is delegated to the network layer (NetworkPolicy / security group /
+	// service mesh) since this API is reachable inside the cluster; the timeouts below are
+	// general hardening (a slow or idle client can't tie up a connection indefinitely).
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           a,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      30 * time.Second, // generous: a tokens(start=0) scan over a large store is included in this window
+		IdleTimeout:       60 * time.Second,
+	}
 
 	go func() {
 		<-ctx.Done()
